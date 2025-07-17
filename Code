@@ -1,0 +1,10 @@
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y python3-pip python3-venv git curl wget
+sudo apt install -y muscle clustalw ncbi-blast+ emboss
+pip install --upgrade pip
+pip install biopython pandas numpy matplotlib seaborn requests
+muscle -version
+#If muscle not working
+wget https://github.com/rcedgar/muscle/releases/download/v5.1/muscle5.1.linux_intel64
+chmod +x muscle5.1.linux_intel64
+sudo mv muscle5.1.linux_intel64 /usr/local/bin/muscle
