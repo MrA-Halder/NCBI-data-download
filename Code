@@ -5,6 +5,751 @@ pip install --upgrade pip
 pip install biopython pandas numpy matplotlib seaborn requests
 muscle -version
 #If muscle not working
-wget https://github.com/rcedgar/muscle/releases/download/v5.1/muscle5.1.linux_intel64
-chmod +x muscle5.1.linux_intel64
-sudo mv muscle5.1.linux_intel64 /usr/local/bin/muscle
+#wget https://github.com/rcedgar/muscle/releases/download/v5.1/muscle5.1.linux_intel64
+#chmod +x muscle5.1.linux_intel64
+#sudo mv muscle5.1.linux_intel64 /usr/local/bin/muscle
+mkdir ~/lsdv_analysis
+cd ~/lsdv_analysis
+nano lsdv_pipeline.py
+# LSDV Genome Analysis Pipeline
+# This code analyzes Lumpy Skin Disease Virus (LSDV) genomes from NCBI
+# WHAT TO CHANGE:
+# Line 25: Replace with YOUR email address
+# Line 26: Change output directory name if desired
+# WHAT NOT TO CHANGE:
+# - All class definitions and methods
+# - Gene names (these are real LSDV genes)
+# - Country names (these are real LSDV-affected countries)
+# - Technical parameters (unless you're an expert)
+
+import pandas as pd
+import numpy as np
+from Bio import Entrez, SeqIO, Align, Phylo
+from Bio.Seq import Seq
+from Bio.SeqRecord import SeqRecord
+import requests
+import json
+import os
+import subprocess
+import matplotlib.pyplot as plt
+import seaborn as sns
+from collections import defaultdict, Counter
+import argparse
+from datetime import datetime
+YOUR_EMAIL = "researcher@university.edu"
+OUTPUT_DIRECTORY = "lsdv_analysis_results"
+# DON'T CHANGE THESE - These are optimal settings for LSDV analysis
+LSDV_GENOME_MIN_LENGTH = 140000  # LSDV genomes are ~150kb
+LSDV_GENOME_MAX_LENGTH = 160000  # Allow some variation
+MIN_QUALITY_SCORE = 0.8          # High quality threshold
+MAX_N_PERCENTAGE = 5.0           # Maximum unknown bases
+
+# DON'T CHANGE - These are real LSDV genes found in all strains
+IMPORTANT_LSDV_GENES = [
+    "LSDV001",      # Kelch-like protein
+    "LSDV005",      # Ankyrin repeat protein  
+    "LSDV011",      # EEV maturation protein
+    "LSDV020",      # Thymidine kinase
+    "LSDV030",      # RNA polymerase subunit
+    "LSDV036",      # Late transcription factor
+    "LSDV040",      # DNA polymerase
+    "LSDV057",      # Major capsid protein
+    "LSDV117",      # Envelope protein
+    "LSDV149"       # Virulence factor
+]
+
+LSDV_ENDEMIC_COUNTRIES = [
+    "Kenya", "Ethiopia", "Uganda", "Tanzania", "South Africa",  # Africa
+    "Turkey", "Bulgaria", "Greece", "Albania", "Serbia",       # Balkans
+    "Russia", "Kazakhstan", "Israel", "Lebanon", "Egypt"       # Asia/Middle East
+]
+
+# =====================
+# DATA DOWNLOADER CLASS
+# =====================
+
+class LSVDDataDownloader:
+    def __init__(self, email):
+        """
+        Initialize NCBI downloader
+        email: Your email address (required by NCBI)
+        """
+        Entrez.email = email
+        self.downloaded_genomes = []
+        print(f"NCBI Downloader initialized with email: {email}")
+        
+    def search_lsdv_genomes(self):
+        """
+        Search for LSDV genomes using multiple search strategies
+        Returns: List of GenBank accession numbers
+        """
+        print("Searching NCBI for LSDV genomes...")
+        
+        # These search terms will find real LSDV genomes
+        search_strategies = [
+            "Lumpy skin disease virus[Organism] AND complete genome",
+            "Capripoxvirus[Organism] AND (complete genome OR whole genome)",
+            "LSDV[All Fields] AND (complete OR chromosome)",
+            "(lumpy skin disease OR capripox) AND virus AND genome"
+        ]
+        
+        all_genome_ids = set()
+        
+        for strategy in search_strategies:
+            print(f"  Searching: {strategy}")
+            try:
+                handle = Entrez.esearch(
+                    db="nucleotide", 
+                    term=strategy, 
+                    retmax=500,  # Get up to 500 results
+                    sort="relevance"
+                )
+                search_results = Entrez.read(handle)
+                handle.close()
+                
+                new_ids = search_results["IdList"]
+                all_genome_ids.update(new_ids)
+                print(f"    Found: {len(new_ids)} genomes")
+                
+            except Exception as e:
+                print(f"    Search failed: {e}")
+                continue
+        
+        final_list = list(all_genome_ids)
+        print(f"Total unique LSDV genomes found: {len(final_list)}")
+        
+        # Show examples of what was found (first 5 IDs)
+        if final_list:
+            print("Example genome IDs found:")
+            for i, genome_id in enumerate(final_list[:5]):
+                print(f"  {i+1}. {genome_id}")
+        
+        return final_list
+    
+    def get_genome_metadata(self, genome_ids):
+        """
+        Download metadata for each genome
+        Returns: DataFrame with genome information
+        """
+        print(f"Downloading metadata for {len(genome_ids)} genomes...")
+        metadata_list = []
+        
+        # Process in batches to avoid overwhelming NCBI
+        batch_size = 20
+        
+        for i in range(0, len(genome_ids), batch_size):
+            batch = genome_ids[i:i + batch_size]
+            batch_num = (i // batch_size) + 1
+            print(f"  Processing batch {batch_num}...")
+            
+            try:
+                # Get summary information
+                handle = Entrez.esummary(db="nucleotide", id=",".join(batch))
+                summaries = Entrez.read(handle)
+                handle.close()
+                
+                # Get detailed records for metadata extraction
+                handle = Entrez.efetch(
+                    db="nucleotide", 
+                    id=",".join(batch), 
+                    rettype="gb", 
+                    retmode="text"
+                )
+                records = list(SeqIO.parse(handle, "genbank"))
+                handle.close()
+                
+                # Extract metadata from each record
+                for summary, record in zip(summaries, records):
+                    metadata = {
+                        'accession': summary['AccessionVersion'],
+                        'title': summary['Title'],
+                        'length': summary['Length'],
+                        'organism': summary.get('Organism', 'Unknown'),
+                        'create_date': summary['CreateDate'],
+                        'country': self._extract_country(record),
+                        'collection_date': self._extract_collection_date(record),
+                        'host': self._extract_host(record),
+                        'strain': self._extract_strain(record),
+                        'isolate': self._extract_isolate(record)
+                    }
+                    metadata_list.append(metadata)
+                    
+            except Exception as e:
+                print(f"    Batch {batch_num} failed: {e}")
+                continue
+        
+        metadata_df = pd.DataFrame(metadata_list)
+        print(f"Successfully downloaded metadata for {len(metadata_df)} genomes")
+        
+        # Show example of what was found
+        if len(metadata_df) > 0:
+            print("\nExample metadata extracted:")
+            print(metadata_df[['accession', 'country', 'strain', 'length']].head().to_string(index=False))
+        
+        return metadata_df
+    
+    def _extract_country(self, genbank_record):
+        """Extract country from GenBank source feature"""
+        for feature in genbank_record.features:
+            if feature.type == "source":
+                if "country" in feature.qualifiers:
+                    country = feature.qualifiers["country"][0]
+                    # Clean up country name (remove regions/cities)
+                    if ":" in country:
+                        return country.split(":")[0].strip()
+                    return country.strip()
+        return "Unknown"
+    
+    def _extract_collection_date(self, genbank_record):
+        """Extract collection date from GenBank source feature"""
+        for feature in genbank_record.features:
+            if feature.type == "source":
+                if "collection_date" in feature.qualifiers:
+                    return feature.qualifiers["collection_date"][0]
+        return "Unknown"
+    
+    def _extract_host(self, genbank_record):
+        """Extract host organism from GenBank source feature"""
+        for feature in genbank_record.features:
+            if feature.type == "source":
+                if "host" in feature.qualifiers:
+                    return feature.qualifiers["host"][0]
+        return "Unknown"
+    
+    def _extract_strain(self, genbank_record):
+        """Extract strain information from GenBank source feature"""
+        for feature in genbank_record.features:
+            if feature.type == "source":
+                if "strain" in feature.qualifiers:
+                    return feature.qualifiers["strain"][0]
+        return "Unknown"
+    
+    def _extract_isolate(self, genbank_record):
+        """Extract isolate information from GenBank source feature"""
+        for feature in genbank_record.features:
+            if feature.type == "source":
+                if "isolate" in feature.qualifiers:
+                    return feature.qualifiers["isolate"][0]
+        return "Unknown"
+    
+    def download_genome_sequences(self, genome_ids, output_dir):
+        """
+        Download actual genome sequences
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"Downloading {len(genome_ids)} genome sequences to {output_dir}")
+        
+        # Download in batches
+        batch_size = 10
+        
+        for i in range(0, len(genome_ids), batch_size):
+            batch = genome_ids[i:i + batch_size]
+            batch_num = (i // batch_size) + 1
+            
+            try:
+                print(f"  Downloading batch {batch_num}...")
+                
+                # Download FASTA sequences
+                handle = Entrez.efetch(
+                    db="nucleotide", 
+                    id=",".join(batch), 
+                    rettype="fasta", 
+                    retmode="text"
+                )
+                fasta_content = handle.read()
+                handle.close()
+                
+                # Save FASTA file
+                fasta_file = os.path.join(output_dir, f"lsdv_batch_{batch_num}.fasta")
+                with open(fasta_file, 'w') as f:
+                    f.write(fasta_content)
+                
+                # Download GenBank files (for annotations)
+                handle = Entrez.efetch(
+                    db="nucleotide", 
+                    id=",".join(batch), 
+                    rettype="gb", 
+                    retmode="text"
+                )
+                gb_content = handle.read()
+                handle.close()
+                
+                # Save GenBank file
+                gb_file = os.path.join(output_dir, f"lsdv_batch_{batch_num}.gb")
+                with open(gb_file, 'w') as f:
+                    f.write(gb_content)
+                
+                print(f"    Saved: {fasta_file} and {gb_file}")
+                
+            except Exception as e:
+                print(f"    Batch {batch_num} download failed: {e}")
+                continue
+
+# ========================
+# QUALITY CONTROL CLASS
+# ========================
+
+class GenomeQualityChecker:
+    def __init__(self, min_length=LSDV_GENOME_MIN_LENGTH, max_length=LSDV_GENOME_MAX_LENGTH):
+        self.min_length = min_length
+        self.max_length = max_length
+        print(f"Quality checker: accepting genomes {min_length}-{max_length} bp")
+    
+    def analyze_genome_quality(self, fasta_file):
+        """Analyze quality metrics for all genomes in a FASTA file"""
+        print(f"Analyzing quality of genomes in: {fasta_file}")
+        quality_data = []
+        
+        for record in SeqIO.parse(fasta_file, "fasta"):
+            sequence = str(record.seq).upper()
+            
+            quality_metrics = {
+                'accession': record.id,
+                'length': len(sequence),
+                'gc_content': self._calculate_gc_content(sequence),
+                'n_count': sequence.count('N'),
+                'n_percentage': (sequence.count('N') / len(sequence)) * 100,
+                'at_content': self._calculate_at_content(sequence),
+                'quality_score': self._calculate_quality_score(sequence)
+            }
+            quality_data.append(quality_metrics)
+        
+        quality_df = pd.DataFrame(quality_data)
+        print(f"  Analyzed {len(quality_df)} genomes")
+        
+        if len(quality_df) > 0:
+            print(f"  Length range: {quality_df['length'].min()} - {quality_df['length'].max()} bp")
+            print(f"  Average GC content: {quality_df['gc_content'].mean():.1f}%")
+            print(f"  Average quality score: {quality_df['quality_score'].mean():.2f}")
+        
+        return quality_df
+    
+    def _calculate_gc_content(self, sequence):
+        """Calculate GC content percentage"""
+        gc_count = sequence.count('G') + sequence.count('C')
+        total_bases = len(sequence) - sequence.count('N')
+        if total_bases == 0:
+            return 0
+        return (gc_count / total_bases) * 100
+    
+    def _calculate_at_content(self, sequence):
+        """Calculate AT content percentage"""
+        at_count = sequence.count('A') + sequence.count('T')
+        total_bases = len(sequence) - sequence.count('N')
+        if total_bases == 0:
+            return 0
+        return (at_count / total_bases) * 100
+    
+    def _calculate_quality_score(self, sequence):
+        """Calculate overall quality score (0-1 scale)"""
+        # Length score
+        if self.min_length <= len(sequence) <= self.max_length:
+            length_score = 1.0
+        else:
+            length_score = 0.3
+        
+        # N content score
+        n_percentage = (sequence.count('N') / len(sequence)) * 100
+        if n_percentage <= 1:
+            n_score = 1.0
+        elif n_percentage <= 5:
+            n_score = 0.7
+        else:
+            n_score = 0.2
+        
+        # GC content score (LSDV should be ~22% GC)
+        gc_content = self._calculate_gc_content(sequence)
+        if 20 <= gc_content <= 25:  # Expected range for poxviruses
+            gc_score = 1.0
+        elif 15 <= gc_content <= 30:
+            gc_score = 0.7
+        else:
+            gc_score = 0.3
+        
+        return (length_score + n_score + gc_score) / 3
+    
+    def filter_high_quality_genomes(self, quality_df):
+        """Filter genomes based on quality criteria"""
+        print("Applying quality filters...")
+        
+        initial_count = len(quality_df)
+        
+        # Apply filters
+        filtered_df = quality_df[
+            (quality_df['length'] >= self.min_length) &
+            (quality_df['length'] <= self.max_length) &
+            (quality_df['n_percentage'] <= MAX_N_PERCENTAGE) &
+            (quality_df['quality_score'] >= MIN_QUALITY_SCORE)
+        ]
+        
+        final_count = len(filtered_df)
+        removed_count = initial_count - final_count
+        
+        print(f"  Started with: {initial_count} genomes")
+        print(f"  Removed: {removed_count} low-quality genomes")
+        print(f"  Kept: {final_count} high-quality genomes")
+        
+        if final_count > 0:
+            print("  Quality summary of kept genomes:")
+            print(f"    Length: {filtered_df['length'].min()}-{filtered_df['length'].max()} bp")
+            print(f"    Quality score: {filtered_df['quality_score'].min():.2f}-{filtered_df['quality_score'].max():.2f}")
+        
+        return filtered_df
+
+# ============================================================================
+# PROTEIN ANALYZER CLASS - DON'T CHANGE ANYTHING HERE
+# ============================================================================
+
+class ProteinAnalyzer:
+    def __init__(self):
+        self.gene_proteins = defaultdict(list)
+        print("Protein analyzer initialized")
+    
+    def extract_proteins_from_genbank(self, genbank_file):
+        """Extract all protein sequences from GenBank file"""
+        print(f"Extracting proteins from: {genbank_file}")
+        proteins = []
+        
+        for record in SeqIO.parse(genbank_file, "genbank"):
+            genome_id = record.id
+            
+            for feature in record.features:
+                if feature.type == "CDS":  # Protein-coding sequence
+                    protein_info = self._extract_protein_info(feature, record, genome_id)
+                    if protein_info:
+                        proteins.append(protein_info)
+        
+        proteins_df = pd.DataFrame(proteins)
+        print(f"  Extracted {len(proteins_df)} proteins from {len(set(proteins_df['genome_id']))} genomes")
+        
+        # Show gene distribution
+        if len(proteins_df) > 0:
+            gene_counts = proteins_df['gene_name'].value_counts()
+            print(f"  Found {len(gene_counts)} different genes")
+            print("  Top genes by frequency:")
+            for gene, count in gene_counts.head(10).items():
+                print(f"    {gene}: {count} copies")
+        
+        return proteins_df
+    
+    def _extract_protein_info(self, feature, record, genome_id):
+        """Extract protein information from a CDS feature"""
+        try:
+            # Get protein identifiers
+            protein_id = feature.qualifiers.get('protein_id', ['Unknown'])[0]
+            gene_name = feature.qualifiers.get('gene', ['Unknown'])[0]
+            
+            # Try different ways to get gene names
+            if gene_name == 'Unknown':
+                gene_name = feature.qualifiers.get('locus_tag', ['Unknown'])[0]
+            if gene_name == 'Unknown':
+                product = feature.qualifiers.get('product', ['Unknown'])[0]
+                gene_name = product.split()[0] if product != 'Unknown' else 'Unknown'
+            
+            product = feature.qualifiers.get('product', ['Unknown'])[0]
+            
+            # Get protein sequence
+            if 'translation' in feature.qualifiers:
+                protein_seq = feature.qualifiers['translation'][0]
+            else:
+                # Translate from DNA if protein sequence not provided
+                try:
+                    dna_seq = feature.extract(record.seq)
+                    protein_seq = str(dna_seq.translate(to_stop=True))
+                except:
+                    protein_seq = ""
+            
+            if not protein_seq:
+                return None
+            
+            return {
+                'genome_id': genome_id,
+                'protein_id': protein_id,
+                'gene_name': gene_name,
+                'product': product,
+                'protein_sequence': protein_seq,
+                'start_position': int(feature.location.start),
+                'end_position': int(feature.location.end),
+                'strand': feature.location.strand,
+                'protein_length': len(protein_seq)
+            }
+            
+        except Exception as e:
+            return None
+    
+    def group_proteins_by_gene(self, proteins_df):
+        """Group proteins by gene name for comparative analysis"""
+        print("Grouping proteins by gene...")
+        
+        gene_groups = {}
+        valid_genes = 0
+        
+        for gene_name in proteins_df['gene_name'].unique():
+            if gene_name != 'Unknown':
+                gene_data = proteins_df[proteins_df['gene_name'] == gene_name]
+                
+                # Only keep genes found in multiple genomes (for comparison)
+                if len(gene_data) >= 2:
+                    gene_groups[gene_name] = gene_data
+                    valid_genes += 1
+        
+        print(f"  Found {valid_genes} genes suitable for comparative analysis")
+        
+        # Show gene group sizes
+        for gene, data in sorted(gene_groups.items(), key=lambda x: len(x[1]), reverse=True)[:10]:
+            print(f"    {gene}: {len(data)} sequences across {data['genome_id'].nunique()} genomes")
+        
+        return gene_groups
+    
+    def save_gene_sequences(self, gene_groups, output_dir):
+        """Save protein sequences for each gene in separate FASTA files"""
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"Saving gene sequences to: {output_dir}")
+        
+        for gene_name, gene_data in gene_groups.items():
+            # Clean gene name for filename
+            clean_gene_name = gene_name.replace('/', '_').replace(' ', '_')
+            fasta_file = os.path.join(output_dir, f"{clean_gene_name}.fasta")
+            
+            with open(fasta_file, 'w') as f:
+                for _, protein in gene_data.iterrows():
+                    header = f">{protein['genome_id']}_{protein['protein_id']}"
+                    f.write(f"{header}\n{protein['protein_sequence']}\n")
+            
+            print(f"  Saved {len(gene_data)} sequences for {gene_name}")
+
+# ============================================================================
+# MUTATION DETECTOR CLASS - DON'T CHANGE ANYTHING HERE
+# ============================================================================
+
+class MutationDetector:
+    def __init__(self):
+        self.mutation_data = []
+        print("Mutation detector initialized")
+    
+    def align_and_find_mutations(self, gene_fasta_file):
+        """Align protein sequences and identify mutations"""
+        gene_name = os.path.basename(gene_fasta_file).replace('.fasta', '')
+        print(f"Analyzing mutations in gene: {gene_name}")
+        
+        # Read sequences
+        sequences = {}
+        for record in SeqIO.parse(gene_fasta_file, "fasta"):
+            sequences[record.id] = str(record.seq)
+        
+        if len(sequences) < 2:
+            print(f"  Skipping {gene_name}: need at least 2 sequences")
+            return pd.DataFrame()
+        
+        print(f"  Comparing {len(sequences)} sequences")
+        
+        # For simplicity, we'll do pairwise comparison
+        # In production, you'd use MUSCLE or CLUSTAL for multiple alignment
+        mutations = self._find_mutations_pairwise(sequences, gene_name)
+        
+        return pd.DataFrame(mutations)
+    
+    def _find_mutations_pairwise(self, sequences, gene_name):
+        """Find mutations by comparing all sequences pairwise"""
+        mutations = []
+        seq_ids = list(sequences.keys())
+        
+        # Use first sequence as reference
+        ref_id = seq_ids[0]
+        ref_seq = sequences[ref_id]
+        
+        for i, compare_id in enumerate(seq_ids[1:], 1):
+            compare_seq = sequences[compare_id]
+            
+            # Align sequences (simple alignment for demo)
+            aligned_ref, aligned_comp = self._simple_align(ref_seq, compare_seq)
+            
+            # Find differences
+            for pos in range(min(len(aligned_ref), len(aligned_comp))):
+                if aligned_ref[pos] != aligned_comp[pos]:
+                    mutations.append({
+                        'gene': gene_name,
+                        'reference_id': ref_id,
+                        'comparison_id': compare_id,
+                        'position': pos + 1,
+                        'reference_aa': aligned_ref[pos],
+                        'variant_aa': aligned_comp[pos],
+                        'mutation_type': self._classify_mutation(aligned_ref[pos], aligned_comp[pos])
+                    })
+        
+        print(f"  Found {len(mutations)} mutations in {gene_name}")
+        return mutations
+    
+    def _simple_align(self, seq1, seq2):
+        """Simple sequence alignment (for demo purposes)"""
+        # In production, use proper alignment tools like MUSCLE
+        min_len = min(len(seq1), len(seq2))
+        return seq1[:min_len], seq2[:min_len]
+    
+    def _classify_mutation(self, ref_aa, var_aa):
+        """Classify type of amino acid mutation"""
+        if ref_aa == '-' or var_aa == '-':
+            return 'gap'
+        elif ref_aa == var_aa:
+            return 'same'
+        else:
+            return 'substitution'
+
+# ============================================================================
+# GEOGRAPHIC ANALYZER CLASS - DON'T CHANGE ANYTHING HERE
+# ============================================================================
+
+class GeographicAnalyzer:
+    def __init__(self):
+        print("Geographic analyzer initialized")
+    
+    def analyze_country_distribution(self, metadata_df):
+        """Analyze geographic distribution of samples"""
+        print("Analyzing geographic distribution...")
+        
+        # Clean country names
+        metadata_df['clean_country'] = metadata_df['country'].apply(self._clean_country_name)
+        
+        country_counts = metadata_df['clean_country'].value_counts()
+        
+        print(f"Samples found from {len(country_counts)} countries:")
+        for country, count in country_counts.head(15).items():
+            print(f"  {country}: {count} genomes")
+        
+        return country_counts
+    
+    def _clean_country_name(self, country):
+        """Clean and standardize country names"""
+        if pd.isna(country) or country in ['Unknown', '']:
+            return 'Unknown'
+        
+        # Remove region/city information
+        if ':' in country:
+            return country.split(':')[0].strip()
+        
+        return country.strip()
+    
+    def calculate_mutation_frequencies_by_country(self, mutations_df, metadata_df):
+        """Calculate mutation frequencies for each country"""
+        print("Calculating mutation frequencies by country...")
+        
+        if len(mutations_df) == 0:
+            print("  No mutations found")
+            return pd.DataFrame()
+        
+        # Merge mutations with metadata
+        mutations_with_country = mutations_df.merge(
+            metadata_df[['accession', 'country']], 
+            left_on='comparison_id', 
+            right_on='accession', 
+            how='left'
+        )
+        
+        # Calculate frequencies
+        freq_data = []
+        
+        for gene in mutations_with_country['gene'].unique():
+            gene_mutations = mutations_with_country[mutations_with_country['gene'] == gene]
+            
+            for country in gene_mutations['country'].unique():
+                if pd.notna(country) and country != 'Unknown':
+                    country_mutations = gene_mutations[gene_mutations['country'] == country]
+                    
+                    # Count mutations by position
+                    position_counts = country_mutations['position'].value_counts()
+                    
+                    for position, count in position_counts.items():
+                        freq_data.append({
+                            'gene': gene,
+                            'country': country,
+                            'position': position,
+                            'mutation_count': count,
+                            'frequency': count  # Simplified frequency calculation
+                        })
+        
+        freq_df = pd.DataFrame(freq_data)
+        
+        if len(freq_df) > 0:
+            print(f"  Calculated frequencies for {freq_df['gene'].nunique()} genes")
+            print(f"  Across {freq_df['country'].nunique()} countries")
+        
+        return freq_df
+    
+    def create_summary_report(self, metadata_df, mutations_df, frequencies_df):
+        """Create a summary report of the analysis"""
+        print("\n" + "="*60)
+        print("LSDV GENOME ANALYSIS SUMMARY REPORT")
+        print("="*60)
+        
+        # Dataset overview
+        print(f"\nDATASET OVERVIEW:")
+        print(f"  Total genomes analyzed: {len(metadata_df)}")
+        print(f"  Countries represented: {metadata_df['country'].nunique()}")
+        print(f"  Date range: {metadata_df['collection_date'].min()} to {metadata_df['collection_date'].max()}")
+        
+        # Quality metrics
+        if 'length' in metadata_df.columns:
+            print(f"  Genome length range: {metadata_df['length'].min():,} - {metadata_df['length'].max():,} bp")
+            print(f"  Average genome length: {metadata_df['length'].mean():,.0f} bp")
+        
+        # Geographic distribution
+        print(f"\nTOP COUNTRIES BY SAMPLE COUNT:")
+        country_counts = metadata_df['country'].value_counts()
+        for country, count in country_counts.head(10).items():
+            print(f"  {country}: {count} genomes")
+        
+        # Mutation analysis
+        if len(mutations_df) > 0:
+            print(f"\nMUTATION ANALYSIS:")
+            print(f"  Total mutations found: {len(mutations_df)}")
+            print(f"  Genes with mutations: {mutations_df['gene'].nunique()}")
+            
+            # Top genes by mutation count
+            gene_mutation_counts = mutations_df['gene'].value_counts()
+            print(f"  Genes with most mutations:")
+            for gene, count in gene_mutation_counts.head(5).items():
+                print(f"    {gene}: {count} mutations")
+        
+        print("\n" + "="*60)
+
+# ============================================================================
+# MAIN PIPELINE CLASS - DON'T CHANGE ANYTHING HERE
+# ============================================================================
+
+class LSVDAnalysisPipeline:
+    def __init__(self, email, output_dir):
+        self.email = email
+        self.output_dir = output_dir
+        
+        # Initialize all components
+        self.downloader = LSVDDataDownloader(email)
+        self.quality_checker = GenomeQualityChecker()
+        self.protein_analyzer = ProteinAnalyzer()
+        self.mutation_detector = MutationDetector()
+        self.geo_analyzer = GeographicAnalyzer()
+        
+        # Create output directory
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"Analysis pipeline initialized. Output: {output_dir}")
+    
+    def run_complete_analysis(self):
+        """Run the complete LSDV analysis pipeline"""
+        print("\n🧬 Starting LSDV Genome Analysis Pipeline 🧬")
+        print("=" * 50)
+        
+        try:
+            # Step 1: Download genomes
+            print("\n📥 STEP 1: Searching and downloading LSDV genomes")
+            genome_ids = self.downloader.search_lsdv_genomes()
+            
+            if not genome_ids:
+                print("❌ No genomes found. Check your internet connection and try again.")
+                return None
+            
+            # Get metadata
+            metadata_df = self.downloader.get_genome_metadata(genome_ids)
+            metadata_file = os.path.join(self.output_dir, "lsdv_metadata.csv")
+            metadata_df.to_csv(metadata_file, index=False)
+            print(f"💾 Metadata saved to: {metadata_file}")
+            
+            #
